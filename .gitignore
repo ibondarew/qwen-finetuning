@@ -1,0 +1,16 @@
+# Игнорируем скачанные веса моделей и папки результатов
+/qwen3-coder-lora/
+/qwen480b-sft-results/
+/hf_cache/
+*.bin
+*.safetensors
+*.pth
+
+# Игнорируем виртуальное окружение Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Логи
+*.log
