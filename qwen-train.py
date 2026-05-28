@@ -14,11 +14,13 @@ from transformers import (
     TrainingArguments,
 )
 
+# Оптимизация аллокатора памяти CUDA
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
+# Целевые модули для Qwen MoE архитектуры
 Qwen3_CODER_TARGET_MODULES = [
     "q_proj",
     "k_proj",
@@ -36,16 +38,23 @@ def train():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     print(f"Local rank: {local_rank}")
 
+    # Загружаем токенизатор
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+    # ФИКС МИСМАТЧА: У Qwen3 уже есть встроенный pad_token (<|endoftext|> или аналогичный).
+    # Мы НЕ переназначаем его вручную на eos_token, чтобы Trainer не пытался вызвать
+    # resize_token_embeddings, ломая Sharding Plan в DeepSpeed Stage 3.
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if "<|endoftext|>" in tokenizer.get_vocab():
+            tokenizer.pad_token = "<|endoftext|>"
+        else:
+            tokenizer.pad_token = tokenizer.eos_token
 
     torch.cuda.empty_cache()
     gc.collect()
 
     print("Loading 480B model with DeepSpeed ZeRO-3 Init...")
 
-    # Сначала объявляем конфиг LoRA, чтобы он был доступен внутри контекста
     peft_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -55,7 +64,7 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # Инициализируем модель И LoRA внутри одного контекста DeepSpeed
+    # 1. Загружаем базовую модель на мета-девайс через ZeRO-3
     with deepspeed.zero.Init():
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
@@ -64,10 +73,18 @@ def train():
             low_cpu_mem_usage=True,
         )
 
-        # ФИКС: Применяем LoRA здесь, пока веса находятся в состоянии meta-тензоров
-        model = get_peft_model(model, peft_config)
+    # 2. РАБОЧИЙ ХАК: Временно отключаем флаг ZeRO-3 для корректной инициализации LoRA
+    is_zero3_enabled = deepspeed.zero.Init.is_zero3_enabled
+    deepspeed.zero.Init.is_zero3_enabled = lambda: False
 
-    print(f"Model and LoRA layers initialized on rank {local_rank}")
+    try:
+        # Навешиваем LoRA слои поверх мета-структуры базовой модели
+        model = get_peft_model(model, peft_config)
+    finally:
+        # Возвращаем флаг обратно, чтобы DeepSpeed взял управление на этапе обучения
+        deepspeed.zero.Init.is_zero3_enabled = is_zero3_enabled
+
+    print(f"Model and LoRA layers successfully initialized on rank {local_rank}")
 
     if local_rank == 0:
         model.print_trainable_parameters()
@@ -90,6 +107,7 @@ def train():
                 text = f"Instruction: {inst}\nResponse: {out}"
             texts.append(text)
 
+        # Ограничиваем длину для экономии памяти на одном сервере
         result = tokenizer(texts, truncation=True, padding="max_length", max_length=512)
         result["labels"] = result["input_ids"].copy()
         return result
@@ -133,6 +151,7 @@ def train():
         ),
     )
 
+    print("Starting training process...")
     trainer.train()
 
 
