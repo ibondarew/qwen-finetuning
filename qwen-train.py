@@ -14,22 +14,16 @@ from transformers import (
     TrainingArguments,
 )
 
-# Оптимизация аллокатора памяти CUDA
+# Оптимизация аллокатора памяти CUDA для динамических сегментов
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
-# Целевые модули для Qwen MoE архитектуры
-Qwen3_CODER_TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
+# ФИКС МИСМАТЧА: Вешаем LoRA только на слои внимания (Attention).
+# Для MoE-моделей (как Qwen 480B/235B) адаптация самих экспертов (gate_up_proj, down_proj)
+# через PEFT внутри DeepSpeed ZeRO-3 часто ломает размерности осей и приводит к реинициализации весов.
+Qwen3_CODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 MODEL_ID = "Qwen/Qwen3-Coder-480B-A35B-Instruct"
 
@@ -41,9 +35,8 @@ def train():
     # Загружаем токенизатор
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-    # ФИКС МИСМАТЧА: У Qwen3 уже есть встроенный pad_token (<|endoftext|> или аналогичный).
-    # Мы НЕ переназначаем его вручную на eos_token, чтобы Trainer не пытался вызвать
-    # resize_token_embeddings, ломая Sharding Plan в DeepSpeed Stage 3.
+    # ФИКС МИСМАТЧА: Используем нативный pad_token из словаря Qwen,
+    # чтобы предотвратить принудительный resize_token_embeddings, который ломает Sharding Plan.
     if tokenizer.pad_token is None:
         if "<|endoftext|>" in tokenizer.get_vocab():
             tokenizer.pad_token = "<|endoftext|>"
@@ -53,8 +46,9 @@ def train():
     torch.cuda.empty_cache()
     gc.collect()
 
-    print("Loading 480B model with DeepSpeed ZeRO-3 Init...")
+    print("Loading 480B MoE model with DeepSpeed ZeRO-3 Init...")
 
+    # Конфигурация LoRA для блоков внимания
     peft_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -64,7 +58,8 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # 1. Загружаем базовую модель на мета-девайс через ZeRO-3
+    # 1. Загружаем базовую модель на мета-девайс распределенно.
+    # ФИКС: Убираем ignore_mismatched_sizes, так как теперь архитектура совпадает на 100%.
     with deepspeed.zero.Init():
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
@@ -73,15 +68,15 @@ def train():
             low_cpu_mem_usage=True,
         )
 
-    # 2. РАБОЧИЙ ХАК: Временно отключаем флаг ZeRO-3 для корректной инициализации LoRA
+    # 2. ХАК ДЛЯ ОБХОДА META TENSOR: Временно подменяем флаг ZeRO-3 для PEFT,
+    # чтобы адаптеры создались в реальной памяти, не задевая базовые веса модели.
     is_zero3_enabled = deepspeed.zero.Init.is_zero3_enabled
     deepspeed.zero.Init.is_zero3_enabled = lambda: False
 
     try:
-        # Навешиваем LoRA слои поверх мета-структуры базовой модели
         model = get_peft_model(model, peft_config)
     finally:
-        # Возвращаем флаг обратно, чтобы DeepSpeed взял управление на этапе обучения
+        # Возвращаем контроль DeepSpeed обратно перед началом фазы обучения
         deepspeed.zero.Init.is_zero3_enabled = is_zero3_enabled
 
     print(f"Model and LoRA layers successfully initialized on rank {local_rank}")
@@ -107,7 +102,7 @@ def train():
                 text = f"Instruction: {inst}\nResponse: {out}"
             texts.append(text)
 
-        # Ограничиваем длину для экономии памяти на одном сервере
+        # Ограничиваем длину контекста до 512 для безопасного первого теста на одном узле
         result = tokenizer(texts, truncation=True, padding="max_length", max_length=512)
         result["labels"] = result["input_ids"].copy()
         return result
@@ -125,7 +120,7 @@ def train():
         output_dir=f"{BASE_DIR}/qwen3-coder-lora",
         per_device_train_batch_size=1,
         gradient_accumulation_steps=16,
-        learning_rate=5e-6,
+        learning_rate=5e-6,  # Щадящий шаг обучения для гигантских моделей
         bf16=True,
         logging_steps=1,
         num_train_epochs=1,
@@ -139,7 +134,7 @@ def train():
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         ddp_find_unused_parameters=False,
-        gradient_checkpointing=True,
+        gradient_checkpointing=True,  # Экономит колоссальный объем VRAM на активациях
     )
 
     trainer = Trainer(
