@@ -45,21 +45,7 @@ def train():
 
     print("Loading 480B model with DeepSpeed ZeRO-3 Init...")
 
-    # КРИТИЧЕСКИЙ ФИКС: Оборачиваем в Init(), чтобы 8 процессов не взорвали RAM
-    with deepspeed.zero.Init():
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,  # Помогает не дублировать память при загрузке
-        )
-
-    print(f"Model loaded on rank {local_rank}")
-
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    # Снижаем ранг LoRA до 8 для первого теста, чтобы сэкономить память на градиентах
+    # Сначала объявляем конфиг LoRA, чтобы он был доступен внутри контекста
     peft_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -69,9 +55,25 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    model = get_peft_model(model, peft_config)
+    # Инициализируем модель И LoRA внутри одного контекста DeepSpeed
+    with deepspeed.zero.Init():
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
+
+        # ФИКС: Применяем LoRA здесь, пока веса находятся в состоянии meta-тензоров
+        model = get_peft_model(model, peft_config)
+
+    print(f"Model and LoRA layers initialized on rank {local_rank}")
+
     if local_rank == 0:
         model.print_trainable_parameters()
+
+    torch.cuda.empty_cache()
+    gc.collect()
 
     print("Loading dataset...")
     dataset = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
@@ -88,7 +90,6 @@ def train():
                 text = f"Instruction: {inst}\nResponse: {out}"
             texts.append(text)
 
-        # КРИТИЧЕСКИЙ ФИКС: Для 480B на одном сервере уменьшаем max_length до 512, чтобы не словить OOM на активациях
         result = tokenizer(texts, truncation=True, padding="max_length", max_length=512)
         result["labels"] = result["input_ids"].copy()
         return result
@@ -96,7 +97,7 @@ def train():
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
-        batch_size=256,  # Чуть уменьшил батч для стабильности маппинга
+        batch_size=256,
         remove_columns=dataset.column_names,
         desc="Tokenizing dataset",
         num_proc=1,
@@ -105,8 +106,8 @@ def train():
     training_args = TrainingArguments(
         output_dir=f"{BASE_DIR}/qwen3-coder-lora",
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=16,  # Увеличиваем, так как сервер один, а батч нужен большой
-        learning_rate=5e-6,  # КРИТИЧЕСКИЙ ФИКС: Уменьшили LR, чтобы модель не пошла в разнос
+        gradient_accumulation_steps=16,
+        learning_rate=5e-6,
         bf16=True,
         logging_steps=1,
         num_train_epochs=1,
@@ -120,7 +121,7 @@ def train():
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         ddp_find_unused_parameters=False,
-        gradient_checkpointing=True,  # КРИТИЧЕСКИЙ ФИКС: Без этого 480B упадет на первом же шаге
+        gradient_checkpointing=True,
     )
 
     trainer = Trainer(
