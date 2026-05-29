@@ -3,7 +3,6 @@ import gc
 import os
 import pathlib
 
-import deepspeed
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
@@ -68,27 +67,29 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # ФИКС: Загружаем модель сразу в распределенном контексте DeepSpeed ZeRO-3.
-    # Это предотвращает OOM по системной RAM, так как веса не дублируются на каждом процессе.
-    print(f"Process {local_rank} is initializing model via DeepSpeed ZeRO-3 context...")
-    with deepspeed.zero.Init():
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-        )
+    # ФИКС КРИТИЧЕСКОЙ ОШИБКИ META TENSOR:
+    # Убираем with deepspeed.zero.Init(), загружаем базовую модель стандартно.
+    # low_cpu_mem_usage=True не даст взорвать RAM хоста.
+    print(f"Process {local_rank} is loading base model from_pretrained (safe mode)...")
 
-    # ХАК ДЛЯ PEFT: Временно подменяем флаг ZeRO-3, чтобы PEFT мог безболезненно
-    # инициализировать LoRA-адаптеры в реальной памяти, обходя ограничение мета-тензоров.
-    is_zero3_enabled = deepspeed.zero.Init.is_zero3_enabled
-    deepspeed.zero.Init.is_zero3_enabled = lambda: False
+    # Синхронизируем загрузку: rank 0 загружает и кэширует, остальные берут из кэша безопасно
+    if local_rank != 0:
+        dist.barrier()
 
-    try:
-        model = get_peft_model(model, peft_config)
-    finally:
-        # Обязательно возвращаем контроль DeepSpeed обратно перед началом фазы обучения
-        deepspeed.zero.Init.is_zero3_enabled = is_zero3_enabled
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
+
+    if local_rank == 0:
+        dist.barrier()
+
+    # Теперь модель инициализирована с реальными (хоть и ленивыми) тензорами.
+    # get_peft_model отработает штатно, без ошибок копирования данных!
+    print(f"Process {local_rank} is applying LoRA layers...")
+    model = get_peft_model(model, peft_config)
 
     # Включаем чекпоинтинг градиентов для экономии памяти
     model.gradient_checkpointing_enable()
@@ -152,6 +153,9 @@ def train():
         gradient_checkpointing=True,
     )
 
+    # Передаем готовую LoRA модель в Trainer.
+    # Внутри метода trainer.train() библиотека accelerate сама найдет наш ds_config.json
+    # и корректно инициализирует DeepSpeed Engine поверх уже собранных LoRA-адаптеров.
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -162,11 +166,13 @@ def train():
     )
 
     if local_rank == 0:
-        print(
-            "Starting training process (DeepSpeed Stage 3 is streaming weights into GPUs)..."
-        )
+        print("Starting training process (DeepSpeed Stage 3 is taking over)...")
 
     trainer.train()
+
+    # Корректно закрываем распределенную группу при выходе
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
