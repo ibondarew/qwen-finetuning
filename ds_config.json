@@ -17,10 +17,10 @@
     "stage3_max_live_parameters": 20000000,
     "stage3_max_reuse_distance": 20000000
   },
-  "gradient_accumulation_steps": "auto",
+  "gradient_accumulation_steps": 16,
   "gradient_clipping": 1.0,
   "steps_per_print": 10,
-  "train_batch_size": "auto",
-  "train_micro_batch_size_per_gpu": "auto",
+  "train_batch_size": 128,
+  "train_micro_batch_size_per_gpu": 1,
   "zero_allow_untested_optimizer": true
 }
