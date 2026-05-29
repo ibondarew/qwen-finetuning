@@ -1,3 +1,4 @@
+import datetime
 import gc
 import os
 import pathlib
@@ -21,19 +22,25 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
-# LoRA вешается строго на блоки внимания, чтобы не ломать 3D-тензоры экспертов MoE
+# LoRA вешается строго на блоки внимания, чтобы не трогать и не ломать MoE экспертов
 Qwen3_CODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-# Дефолтная модель (подставится, если не задана переменная окружения MODEL_ID)
+# Модель по умолчанию, если не передана переменная окружения
 DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 def train():
-    # Инициализируем распределенный контекст (необходимо для работы барьеров)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    # ФИКС ТАЙМАУТА И МАСШТАБИРОВАНИЯ: Явно привязываем GPU к процессу
+    # и выставляем щедрый таймаут в 30 минут (1800 секунд) для стриминга огромных весов
+    if not dist.is_initialized():
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=datetime.timedelta(seconds=1800),
+        )
     print(f"Local rank: {local_rank} initialized.")
 
     # Динамически получаем имя модели из окружения
@@ -41,7 +48,7 @@ def train():
     if local_rank == 0:
         print(f"\n=== TARGET MODEL FOR TRAINING: {MODEL_ID} ===\n")
 
-    # Токенизатор загружаем на всех процессах (он легкий, кэш блокируется безопасно)
+    # Токенизатор загружаем на всех процессах
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
         if "<|endoftext|>" in tokenizer.get_vocab():
@@ -62,36 +69,22 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # --- ЗАЩИТА RAM: БАРЬЕР СИНХРОНИЗАЦИИ ---
-    # Сначала модель создает только rank 0, чтобы скачать конфиги и прогреть кэш хоста
-    if local_rank == 0:
-        print("Master process (rank 0) is preparing the model structure...")
-        config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-        with torch.device("cpu"):
-            model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True, torch_dtype=torch.bfloat16
-            )
-        model = get_peft_model(model, peft_config)
-        model.gradient_checkpointing_enable()
-        print("Master process successfully prepared the model framework.")
+    # ФИКС НА ТАЙМАУТ И МИСМАТЧ: Создаем каркас на 'meta' девайсе.
+    # Это отрабатывает МГНОВЕННО (за 1 секунду) на всех 8 рангах параллельно.
+    # Больше никакого забивания RAM и никаких зависаний в барьерах.
+    print(f"Process {local_rank} is creating model framework on meta device...")
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-    # Все процессы (1-7) останавливаются тут и ждут, пока rank 0 завершит работу с диском
-    dist.barrier()
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True, torch_dtype=torch.bfloat16
+        )
 
-    # Теперь, когда rank 0 всё подготовил, остальные процессы создают модель из локального кэша.
-    # Это исключает race condition файлов и пиковые перегрузки RAM.
-    if local_rank != 0:
-        config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-        with torch.device("cpu"):
-            model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True, torch_dtype=torch.bfloat16
-            )
-        model = get_peft_model(model, peft_config)
-        model.gradient_checkpointing_enable()
+    # Накатываем LoRA на мета-структуру (сохраняя правильные размерности)
+    model = get_peft_model(model, peft_config)
+    model.gradient_checkpointing_enable()
 
-    # Финальная точка синхронизации: все процессы гарантированно имеют одинаковый пустой каркас модели
-    dist.barrier()
-    # --- КОНЕЦ БЛОКА ЗАЩИТЫ ---
+    print(f"Model framework successfully prepared on rank {local_rank}")
 
     if local_rank == 0:
         model.print_trainable_parameters()
@@ -118,7 +111,6 @@ def train():
         result["labels"] = result["input_ids"].copy()
         return result
 
-    # Токенизацию запускаем параллельно
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
