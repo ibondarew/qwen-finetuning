@@ -2,11 +2,11 @@ import gc
 import os
 import pathlib
 
-import deepspeed
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
@@ -20,23 +20,24 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
-# ФИКС МИСМАТЧА: Вешаем LoRA только на слои внимания (Attention).
-# Для MoE-моделей (как Qwen 480B/235B) адаптация самих экспертов (gate_up_proj, down_proj)
-# через PEFT внутри DeepSpeed ZeRO-3 часто ломает размерности осей и приводит к реинициализации весов.
+# Вешаем LoRA строго на слои внимания, чтобы не трогать MoE экспертов и не ломать размерности
 Qwen3_CODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-MODEL_ID = "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+# Дефолтная модель, если переменная окружения не будет передана
+DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 def train():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     print(f"Local rank: {local_rank}")
 
-    # Загружаем токенизатор
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    # ДИНАМИЧЕСКИЙ ВЫБОР МОДЕЛИ: Читаем из переменной окружения MODEL_ID
+    MODEL_ID = os.environ.get("MODEL_ID", DEFAULT_MODEL_ID)
+    if local_rank == 0:
+        print(f"--- TARGET MODEL FOR TRAINING: {MODEL_ID} ---")
 
-    # ФИКС МИСМАТЧА: Используем нативный pad_token из словаря Qwen,
-    # чтобы предотвратить принудительный resize_token_embeddings, который ломает Sharding Plan.
+    # Загружаем токенизатор для выбранной модели
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
         if "<|endoftext|>" in tokenizer.get_vocab():
             tokenizer.pad_token = "<|endoftext|>"
@@ -46,9 +47,8 @@ def train():
     torch.cuda.empty_cache()
     gc.collect()
 
-    print("Loading 480B MoE model with DeepSpeed ZeRO-3 Init...")
+    print(f"Loading {MODEL_ID} architecture...")
 
-    # Конфигурация LoRA для блоков внимания
     peft_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -58,28 +58,24 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # 1. Загружаем базовую модель на мета-девайс распределенно.
-    # ФИКС: Убираем ignore_mismatched_sizes, так как теперь архитектура совпадает на 100%.
-    with deepspeed.zero.Init():
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
+    # 1. Загружаем родной конфиг модели (скачает правильные кастомные скрипты с HF)
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+    # 2. Создаем пустой каркас модели на CPU с правильной геометрией (без нулевых размеров)
+    with torch.device("cpu"):
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True, torch_dtype=torch.bfloat16
         )
 
-    # 2. ХАК ДЛЯ ОБХОДА META TENSOR: Временно подменяем флаг ZeRO-3 для PEFT,
-    # чтобы адаптеры создались в реальной памяти, не задевая базовые веса модели.
-    is_zero3_enabled = deepspeed.zero.Init.is_zero3_enabled
-    deepspeed.zero.Init.is_zero3_enabled = lambda: False
+    # 3. Навешиваем LoRA на стабильный CPU-каркас
+    model = get_peft_model(model, peft_config)
 
-    try:
-        model = get_peft_model(model, peft_config)
-    finally:
-        # Возвращаем контроль DeepSpeed обратно перед началом фазы обучения
-        deepspeed.zero.Init.is_zero3_enabled = is_zero3_enabled
+    # Включаем чекпоинтинг градиентов для экономии памяти
+    model.gradient_checkpointing_enable()
 
-    print(f"Model and LoRA layers successfully initialized on rank {local_rank}")
+    print(
+        f"Model architecture and LoRA layers successfully prepared on rank {local_rank}"
+    )
 
     if local_rank == 0:
         model.print_trainable_parameters()
@@ -102,7 +98,6 @@ def train():
                 text = f"Instruction: {inst}\nResponse: {out}"
             texts.append(text)
 
-        # Ограничиваем длину контекста до 512 для безопасного первого теста на одном узле
         result = tokenizer(texts, truncation=True, padding="max_length", max_length=512)
         result["labels"] = result["input_ids"].copy()
         return result
@@ -116,11 +111,13 @@ def train():
         num_proc=1,
     )
 
+    # Динамически генерируем имя папки для сохранения чекпоинтов на основе названия модели
+    model_folder_name = MODEL_ID.split("/")[-1].lower()
     training_args = TrainingArguments(
-        output_dir=f"{BASE_DIR}/qwen3-coder-lora",
+        output_dir=f"{BASE_DIR}/{model_folder_name}-lora",
         per_device_train_batch_size=1,
         gradient_accumulation_steps=16,
-        learning_rate=5e-6,  # Щадящий шаг обучения для гигантских моделей
+        learning_rate=5e-6,
         bf16=True,
         logging_steps=1,
         num_train_epochs=1,
@@ -134,7 +131,7 @@ def train():
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         ddp_find_unused_parameters=False,
-        gradient_checkpointing=True,  # Экономит колоссальный объем VRAM на активациях
+        gradient_checkpointing=True,
     )
 
     trainer = Trainer(
@@ -146,7 +143,7 @@ def train():
         ),
     )
 
-    print("Starting training process...")
+    print("Starting training process (DeepSpeed will now load checkpoint weights)...")
     trainer.train()
 
 
