@@ -12,12 +12,10 @@
     },
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "reduce_bucket_size": 2e7,
-    "stage3_prefetch_policy": "sample",
-    "stage3_param_persistence_threshold": 1e4,
-    "stage3_max_live_parameters": 2e7,
-    "stage3_max_reuse_distance": 2e7,
-    "stage3_gather_1d_weights": true
+    "reduce_bucket_size": 20000000,
+    "stage3_param_persistence_threshold": 10000,
+    "stage3_max_live_parameters": 20000000,
+    "stage3_max_reuse_distance": 20000000
   },
   "gradient_accumulation_steps": "auto",
   "gradient_clipping": 1.0,
