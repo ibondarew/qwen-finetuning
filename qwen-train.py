@@ -75,24 +75,19 @@ def train():
     if local_rank == 0:
         print(f"Process {local_rank} is initializing HfDeepSpeedConfig helper...")
 
-    # --- ИСПРАВЛЕНИЕ: Обход ошибки TypeError: '>' not supported between instances of 'str' and 'int' ---
-    # 1. Читаем оригинальный конфиг в словарь
+    # --- ИСПРАВЛЕНИЕ 1: Обход ошибки TypeError: '>' в ассертах DeepSpeed ---
     with open(DS_CONFIG_PATH, "r") as f:
         ds_config_dict = json.load(f)
 
-    # 2. Создаем копию для хелпера загрузки весов
     ds_config_for_helper = json.loads(json.dumps(ds_config_dict))
-
-    # 3. Временно заменяем "auto" на заглушки (int), чтобы DeepSpeed не ругался при парсинге
     ds_config_for_helper["train_micro_batch_size_per_gpu"] = 1
     ds_config_for_helper["gradient_accumulation_steps"] = 1
     ds_config_for_helper["train_batch_size"] = 1
 
-    # 4. Передаем безопасный словарь хелперу. Он перехватит вызов .from_pretrained() и разметит Stage 3
     ds_helper = HfDeepSpeedConfig(ds_config_for_helper)
-    # --------------------------------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
-    # Загружаем модель напрямую (контекст deepspeed.zero.Init() больше не нужен)
+    # Загружаем модель напрямую
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
@@ -101,7 +96,33 @@ def train():
 
     print(f"Process {local_rank} is applying LoRA layers...")
     model = get_peft_model(model, peft_config)
+
+    # --- ИСПРАВЛЕНИЕ 2: Лечим "UserWarning: None of the inputs have requires_grad=True" ---
+    # Принудительно заставляем эмбеддинги требовать градиенты, чтобы работал Gradient Checkpointing с LoRA
+    model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
+
+    # --- ИСПРАВЛЕНИЕ 3: Лечим "AssertionError: loss must be a scalar tensor" ---
+    # Перехватываем forward-пасс модели: если из-за специфики MoE лосс возвращается вектором,
+    # мы принудительно берем .mean(), превращая его в скаляр для DeepSpeed Stage 3.
+    original_forward = model.forward
+
+    def safe_forward(*args, **kwargs):
+        outputs = original_forward(*args, **kwargs)
+        if (
+            isinstance(outputs, dict)
+            and "loss" in outputs
+            and outputs["loss"] is not None
+        ):
+            if outputs["loss"].numel() > 1:
+                outputs["loss"] = outputs["loss"].mean()
+        elif hasattr(outputs, "loss") and outputs.loss is not None:
+            if outputs.loss.numel() > 1:
+                outputs.loss = outputs.loss.mean()
+        return outputs
+
+    model.forward = safe_forward
+    # -----------------------------------------------------------------------
 
     print(f"Model and LoRA layers successfully prepared on rank {local_rank}")
 
@@ -152,7 +173,7 @@ def train():
         save_steps=100,
         save_total_limit=2,
         max_steps=100,
-        deepspeed=DS_CONFIG_PATH,  # Передаем оригинальный путь к файлу, где сохранены "auto"
+        deepspeed=DS_CONFIG_PATH,  # Оригинальный путь со значениями "auto"
         report_to="none",
         optim="adamw_torch",
         warmup_ratio=0.1,
