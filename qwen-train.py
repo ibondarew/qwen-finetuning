@@ -68,18 +68,21 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # ФИКС ОДИНОЧНОГО OOM И META TENSOR:
-    # Возвращаем контекст ZeRO-3 Init, чтобы модель рождалась сразу секционированной по всем 8 GPU.
-    # КРИТИЧЕСКИ ВАЖНО: Убрали параметр low_cpu_mem_usage=True. Именно он ломал совместимость с PEFT.
-    print(f"Process {local_rank} is initializing model via DeepSpeed ZeRO-3 context...")
-    with deepspeed.zero.Init():
+    # ФИКС КРИТИЧЕСКОЙ ОШИБКИ: Передаем конфигурацию напрямую в ZeRO-3 Init.
+    # Теперь DeepSpeed знает про CPU-оффлоад параметров до создания слоев и не падает на мета-тензорах.
+    DS_CONFIG_PATH = os.path.join(BASE_DIR, "ds_config.json")
+    print(
+        f"Process {local_rank} is initializing model via DeepSpeed ZeRO-3 context with config..."
+    )
+
+    with deepspeed.zero.Init(config_dict_or_path=DS_CONFIG_PATH):
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         )
 
-    # Теперь базовые веса корректно обернуты в ZeRO-3, и PEFT спокойно натянет LoRA слои
+    # Спокойно накатываем LoRA адаптеры на распределенную модель
     print(f"Process {local_rank} is applying LoRA layers...")
     model = get_peft_model(model, peft_config)
 
@@ -136,7 +139,7 @@ def train():
         save_steps=100,
         save_total_limit=2,
         max_steps=100,
-        deepspeed=f"{BASE_DIR}/ds_config.json",
+        deepspeed=DS_CONFIG_PATH,
         report_to="none",
         optim="adamw_torch",
         warmup_ratio=0.1,
