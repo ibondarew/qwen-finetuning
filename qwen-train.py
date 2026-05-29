@@ -1,5 +1,6 @@
 import datetime
 import gc
+import json
 import os
 import pathlib
 
@@ -74,9 +75,22 @@ def train():
     if local_rank == 0:
         print(f"Process {local_rank} is initializing HfDeepSpeedConfig helper...")
 
-    # ВАЖНО: Активируем хелпер ДО загрузки модели и сохраняем его в переменную.
-    # Он перехватит вызов .from_pretrained(), распарсит "auto" и предотвратит ошибку meta tensor.
-    ds_helper = HfDeepSpeedConfig(DS_CONFIG_PATH)
+    # --- ИСПРАВЛЕНИЕ: Обход ошибки TypeError: '>' not supported between instances of 'str' and 'int' ---
+    # 1. Читаем оригинальный конфиг в словарь
+    with open(DS_CONFIG_PATH, "r") as f:
+        ds_config_dict = json.load(f)
+
+    # 2. Создаем копию для хелпера загрузки весов
+    ds_config_for_helper = json.loads(json.dumps(ds_config_dict))
+
+    # 3. Временно заменяем "auto" на заглушки (int), чтобы DeepSpeed не ругался при парсинге
+    ds_config_for_helper["train_micro_batch_size_per_gpu"] = 1
+    ds_config_for_helper["gradient_accumulation_steps"] = 1
+    ds_config_for_helper["train_batch_size"] = 1
+
+    # 4. Передаем безопасный словарь хелперу. Он перехватит вызов .from_pretrained() и разметит Stage 3
+    ds_helper = HfDeepSpeedConfig(ds_config_for_helper)
+    # --------------------------------------------------------------------------------------------------
 
     # Загружаем модель напрямую (контекст deepspeed.zero.Init() больше не нужен)
     model = AutoModelForCausalLM.from_pretrained(
@@ -138,7 +152,7 @@ def train():
         save_steps=100,
         save_total_limit=2,
         max_steps=100,
-        deepspeed=DS_CONFIG_PATH,  # Передаем путь к JSON
+        deepspeed=DS_CONFIG_PATH,  # Передаем оригинальный путь к файлу, где сохранены "auto"
         report_to="none",
         optim="adamw_torch",
         warmup_ratio=0.1,
