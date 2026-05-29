@@ -1,20 +1,166 @@
-"zero_optimization": {
-    "stage": 3,
-    "offload_optimizer": {
-      "device": "cpu",
-      "pin_memory": true
-    },
-    "offload_param": {
-      "device": "cpu",
-      "pin_memory": true
-    },
-    "overlap_comm": true,
-    "contiguous_gradients": true,
-    "sub_group_size": 1e9,
-    "reduce_bucket_size": "auto",
-    "stage3_prefetch_policy": "sample",
-    "stage3_param_persistence_threshold": "auto",
-    "stage3_max_live_parameters": 1e9,
-    "stage3_max_reuse_distance": 1e9,
-    "stage3_gather_1d_weights": true
-  }
+import torch
+import pathlib
+import os
+import gc
+import datetime
+import deepspeed
+import torch.distributed as dist
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForSeq2Seq
+)
+from peft import LoraConfig, get_peft_model
+
+# Оптимизация аллокатора памяти CUDA
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
+print(f"Working dir: {BASE_DIR}")
+
+# LoRA вешается строго на блоки внимания, чтобы не ломать и не трогать MoE экспертов
+Qwen3_CODER_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj"
+]
+
+# Модель по умолчанию, если не передана переменная окружения
+DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+
+def train():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    
+    # Явно привязываем GPU к процессу и выставляем таймаут в 30 минут для стабильного стриминга весов
+    if not dist.is_initialized():
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=datetime.timedelta(seconds=1800)
+        )
+    print(f"Local rank: {local_rank} initialized.")
+
+    # Динамически получаем имя модели из окружения
+    MODEL_ID = os.environ.get("MODEL_ID", DEFAULT_MODEL_ID)
+    if local_rank == 0:
+        print(f"\n=== TARGET MODEL FOR TRAINING: {MODEL_ID} ===\n")
+
+    # Токенизатор загружаем на всех процессах
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        if "<|endoftext|>" in tokenizer.get_vocab():
+            tokenizer.pad_token = "<|endoftext|>"
+        else:
+            tokenizer.pad_token = tokenizer.eos_token
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Общая конфигурация LoRA для всех процессов
+    peft_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=Qwen3_CODER_TARGET_MODULES,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+
+    # ФИКС: Загружаем модель сразу в распределенном контексте DeepSpeed ZeRO-3.
+    # Это предотвращает OOM по системной RAM, так как веса не дублируются на каждом процессе.
+    print(f"Process {local_rank} is initializing model via DeepSpeed ZeRO-3 context...")
+    with deepspeed.zero.Init():
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+
+    # ХАК ДЛЯ PEFT: Временно подменяем флаг ZeRO-3, чтобы PEFT мог безболезненно
+    # инициализировать LoRA-адаптеры в реальной памяти, обходя ограничение мета-тензоров.
+    is_zero3_enabled = deepspeed.zero.Init.is_zero3_enabled
+    deepspeed.zero.Init.is_zero3_enabled = lambda: False
+
+    try:
+        model = get_peft_model(model, peft_config)
+    finally:
+        # Обязательно возвращаем контроль DeepSpeed обратно перед началом фазы обучения
+        deepspeed.zero.Init.is_zero3_enabled = is_zero3_enabled
+
+    # Включаем чекпоинтинг градиентов для экономии памяти
+    model.gradient_checkpointing_enable()
+
+    print(f"Model and LoRA layers successfully prepared on rank {local_rank}")
+
+    if local_rank == 0:
+        model.print_trainable_parameters()
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print(f"Process {local_rank} is loading dataset...")
+    dataset = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
+    dataset = dataset.filter(lambda x: x['instruction'] and x['output'], batched=False)
+
+    def tokenize_function(examples):
+        texts = []
+        for inst, inp, out in zip(examples['instruction'], examples.get('input', ['']), examples['output']):
+            if inp:
+                text = f"Instruction: {inst}\nContext: {inp}\nResponse: {out}"
+            else:
+                text = f"Instruction: {inst}\nResponse: {out}"
+            texts.append(text)
+        
+        result = tokenizer(texts, truncation=True, padding="max_length", max_length=512)
+        result['labels'] = result['input_ids'].copy()
+        return result
+
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        batch_size=256,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing dataset",
+        num_proc=1,
+    )
+
+    # Динамически выставляем имя папки чекпоинтов на основе названия модели
+    model_folder_name = MODEL_ID.split('/')[-1].lower()
+    training_args = TrainingArguments(
+        output_dir=f"{BASE_DIR}/{model_folder_name}-lora",
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=16, 
+        learning_rate=5e-6,             
+        bf16=True,
+        logging_steps=1,
+        num_train_epochs=1,
+        save_strategy="steps",
+        save_steps=100,
+        save_total_limit=2,
+        max_steps=100,
+        deepspeed=f"{BASE_DIR}/ds_config.json", 
+        report_to="none",
+        optim="adamw_torch",
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
+        ddp_find_unused_parameters=False,
+        gradient_checkpointing=True,    
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dataset,
+        data_collator=DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors="pt")
+    )
+
+    if local_rank == 0:
+        print("Starting training process (DeepSpeed Stage 3 is streaming weights into GPUs)...")
+        
+    trainer.train()
+
+if __name__ == "__main__":
+    train()
