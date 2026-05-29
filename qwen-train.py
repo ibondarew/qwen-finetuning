@@ -3,12 +3,12 @@ import gc
 import os
 import pathlib
 
+import deepspeed
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
@@ -22,7 +22,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
-# LoRA вешается строго на блоки внимания, чтобы не трогать и не ломать MoE экспертов
+# LoRA вешается строго на блоки внимания, чтобы не ломать и не трогать MoE экспертов
 Qwen3_CODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # Модель по умолчанию, если не передана переменная окружения
@@ -32,8 +32,7 @@ DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 def train():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    # ФИКС ТАЙМАУТА И МАСШТАБИРОВАНИЯ: Явно привязываем GPU к процессу
-    # и выставляем щедрый таймаут в 30 минут (1800 секунд) для стриминга огромных весов
+    # Явно привязываем GPU к процессу и выставляем таймаут в 30 минут для стабильного стриминга весов
     if not dist.is_initialized():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
@@ -69,22 +68,32 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # ФИКС НА ТАЙМАУТ И МИСМАТЧ: Создаем каркас на 'meta' девайсе.
-    # Это отрабатывает МГНОВЕННО (за 1 секунду) на всех 8 рангах параллельно.
-    # Больше никакого забивания RAM и никаких зависаний в барьерах.
-    print(f"Process {local_rank} is creating model framework on meta device...")
-    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(
-            config, trust_remote_code=True, torch_dtype=torch.bfloat16
+    # ФИКС: Загружаем модель сразу в распределенном контексте DeepSpeed ZeRO-3.
+    # Это предотвращает OOM по системной RAM, так как веса не дублируются на каждом процессе.
+    print(f"Process {local_rank} is initializing model via DeepSpeed ZeRO-3 context...")
+    with deepspeed.zero.Init():
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
 
-    # Накатываем LoRA на мета-структуру (сохраняя правильные размерности)
-    model = get_peft_model(model, peft_config)
+    # ХАК ДЛЯ PEFT: Временно подменяем флаг ZeRO-3, чтобы PEFT мог безболезненно
+    # инициализировать LoRA-адаптеры в реальной памяти, обходя ограничение мета-тензоров.
+    is_zero3_enabled = deepspeed.zero.Init.is_zero3_enabled
+    deepspeed.zero.Init.is_zero3_enabled = lambda: False
+
+    try:
+        model = get_peft_model(model, peft_config)
+    finally:
+        # Обязательно возвращаем контроль DeepSpeed обратно перед началом фазы обучения
+        deepspeed.zero.Init.is_zero3_enabled = is_zero3_enabled
+
+    # Включаем чекпоинтинг градиентов для экономии памяти
     model.gradient_checkpointing_enable()
 
-    print(f"Model framework successfully prepared on rank {local_rank}")
+    print(f"Model and LoRA layers successfully prepared on rank {local_rank}")
 
     if local_rank == 0:
         model.print_trainable_parameters()
@@ -154,7 +163,7 @@ def train():
 
     if local_rank == 0:
         print(
-            "Starting training process (DeepSpeed Stage 3 is taking over to stream weights)..."
+            "Starting training process (DeepSpeed Stage 3 is streaming weights into GPUs)..."
         )
 
     trainer.train()
