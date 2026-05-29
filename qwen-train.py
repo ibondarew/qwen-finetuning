@@ -3,6 +3,7 @@ import os
 import pathlib
 
 import torch
+import torch.distributed as dist
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
@@ -14,29 +15,33 @@ from transformers import (
     TrainingArguments,
 )
 
-# Оптимизация аллокатора памяти CUDA для динамических сегментов
+# Оптимизация аллокатора памяти CUDA
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
-# Вешаем LoRA строго на слои внимания, чтобы не трогать MoE экспертов и не ломать размерности
+# LoRA вешается строго на блоки внимания, чтобы не ломать 3D-тензоры экспертов MoE
 Qwen3_CODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-# Дефолтная модель, если переменная окружения не будет передана
+# Дефолтная модель (подставится, если не задана переменная окружения MODEL_ID)
 DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 def train():
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    print(f"Local rank: {local_rank}")
+    # Инициализируем распределенный контекст (необходимо для работы барьеров)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
 
-    # ДИНАМИЧЕСКИЙ ВЫБОР МОДЕЛИ: Читаем из переменной окружения MODEL_ID
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    print(f"Local rank: {local_rank} initialized.")
+
+    # Динамически получаем имя модели из окружения
     MODEL_ID = os.environ.get("MODEL_ID", DEFAULT_MODEL_ID)
     if local_rank == 0:
-        print(f"--- TARGET MODEL FOR TRAINING: {MODEL_ID} ---")
+        print(f"\n=== TARGET MODEL FOR TRAINING: {MODEL_ID} ===\n")
 
-    # Загружаем токенизатор для выбранной модели
+    # Токенизатор загружаем на всех процессах (он легкий, кэш блокируется безопасно)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
         if "<|endoftext|>" in tokenizer.get_vocab():
@@ -47,8 +52,7 @@ def train():
     torch.cuda.empty_cache()
     gc.collect()
 
-    print(f"Loading {MODEL_ID} architecture...")
-
+    # Общая конфигурация LoRA для всех процессов
     peft_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -58,24 +62,36 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # 1. Загружаем родной конфиг модели (скачает правильные кастомные скрипты с HF)
-    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    # --- ЗАЩИТА RAM: БАРЬЕР СИНХРОНИЗАЦИИ ---
+    # Сначала модель создает только rank 0, чтобы скачать конфиги и прогреть кэш хоста
+    if local_rank == 0:
+        print("Master process (rank 0) is preparing the model structure...")
+        config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+        with torch.device("cpu"):
+            model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=True, torch_dtype=torch.bfloat16
+            )
+        model = get_peft_model(model, peft_config)
+        model.gradient_checkpointing_enable()
+        print("Master process successfully prepared the model framework.")
 
-    # 2. Создаем пустой каркас модели на CPU с правильной геометрией (без нулевых размеров)
-    with torch.device("cpu"):
-        model = AutoModelForCausalLM.from_config(
-            config, trust_remote_code=True, torch_dtype=torch.bfloat16
-        )
+    # Все процессы (1-7) останавливаются тут и ждут, пока rank 0 завершит работу с диском
+    dist.barrier()
 
-    # 3. Навешиваем LoRA на стабильный CPU-каркас
-    model = get_peft_model(model, peft_config)
+    # Теперь, когда rank 0 всё подготовил, остальные процессы создают модель из локального кэша.
+    # Это исключает race condition файлов и пиковые перегрузки RAM.
+    if local_rank != 0:
+        config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+        with torch.device("cpu"):
+            model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=True, torch_dtype=torch.bfloat16
+            )
+        model = get_peft_model(model, peft_config)
+        model.gradient_checkpointing_enable()
 
-    # Включаем чекпоинтинг градиентов для экономии памяти
-    model.gradient_checkpointing_enable()
-
-    print(
-        f"Model architecture and LoRA layers successfully prepared on rank {local_rank}"
-    )
+    # Финальная точка синхронизации: все процессы гарантированно имеют одинаковый пустой каркас модели
+    dist.barrier()
+    # --- КОНЕЦ БЛОКА ЗАЩИТЫ ---
 
     if local_rank == 0:
         model.print_trainable_parameters()
@@ -83,7 +99,7 @@ def train():
     torch.cuda.empty_cache()
     gc.collect()
 
-    print("Loading dataset...")
+    print(f"Process {local_rank} is loading dataset...")
     dataset = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
     dataset = dataset.filter(lambda x: x["instruction"] and x["output"], batched=False)
 
@@ -102,6 +118,7 @@ def train():
         result["labels"] = result["input_ids"].copy()
         return result
 
+    # Токенизацию запускаем параллельно
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
@@ -111,7 +128,7 @@ def train():
         num_proc=1,
     )
 
-    # Динамически генерируем имя папки для сохранения чекпоинтов на основе названия модели
+    # Динамически выставляем имя папки чекпоинтов на основе названия модели
     model_folder_name = MODEL_ID.split("/")[-1].lower()
     training_args = TrainingArguments(
         output_dir=f"{BASE_DIR}/{model_folder_name}-lora",
@@ -143,7 +160,11 @@ def train():
         ),
     )
 
-    print("Starting training process (DeepSpeed will now load checkpoint weights)...")
+    if local_rank == 0:
+        print(
+            "Starting training process (DeepSpeed Stage 3 is taking over to stream weights)..."
+        )
+
     trainer.train()
 
 
