@@ -1,6 +1,5 @@
 import datetime
 import gc
-import json
 import os
 import pathlib
 
@@ -16,7 +15,7 @@ from transformers import (
     TrainingArguments,
 )
 
-# Импортируем мост между Transformers и DeepSpeed
+# Импортируем официальный интеграционный хелпер
 from transformers.integrations import HfDeepSpeedConfig
 
 # Оптимизация аллокатора памяти CUDA
@@ -25,14 +24,17 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
-# LoRA вешается строго на блоки внимания
+# LoRA вешается строго на блоки внимания, чтобы не ломать MoE экспертов
 Qwen3_CODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# Модель по умолчанию, если не передана переменная окружения
 DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 def train():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+    # Явно привязываем GPU к процессу и выставляем таймаут в 30 минут
     if not dist.is_initialized():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
@@ -67,29 +69,16 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # ДИНАМИЧЕСКАЯ СБОРКА КОНФИГА DEEPSPEED
     DS_CONFIG_PATH = os.path.join(BASE_DIR, "ds_config.json")
-    with open(DS_CONFIG_PATH, "r") as f:
-        ds_config = json.load(f)
-
-    micro_batch = 1
-    grad_accum = 16
-    ds_config["train_micro_batch_size_per_gpu"] = micro_batch
-    ds_config["gradient_accumulation_steps"] = grad_accum
-    ds_config["train_batch_size"] = micro_batch * grad_accum * world_size
 
     if local_rank == 0:
-        print(
-            f"Generated DS Config: train_batch_size={ds_config['train_batch_size']} for world_size={world_size}"
-        )
-        print(f"Process {local_rank} is initializing HfDeepSpeedConfig...")
+        print(f"Process {local_rank} is initializing HfDeepSpeedConfig helper...")
 
-    # ВАЖНО: Инициализируем HfDeepSpeedConfig ДО загрузки модели.
-    # Обязательно сохраняем ссылку в переменную ds_helper, чтобы объект жил в памяти.
-    # Это перехватит создание мета-тензоров внутри .from_pretrained() и предотвратит ошибку копирования.
-    ds_helper = HfDeepSpeedConfig(ds_config)
+    # ВАЖНО: Активируем хелпер ДО загрузки модели и сохраняем его в переменную.
+    # Он перехватит вызов .from_pretrained(), распарсит "auto" и предотвратит ошибку meta tensor.
+    ds_helper = HfDeepSpeedConfig(DS_CONFIG_PATH)
 
-    # Контекст "with deepspeed.zero.Init()" убираем — хелпер сделает всё сам автоматически и корректно
+    # Загружаем модель напрямую (контекст deepspeed.zero.Init() больше не нужен)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
@@ -139,8 +128,8 @@ def train():
     model_folder_name = MODEL_ID.split("/")[-1].lower()
     training_args = TrainingArguments(
         output_dir=f"{BASE_DIR}/{model_folder_name}-lora",
-        per_device_train_batch_size=micro_batch,
-        gradient_accumulation_steps=grad_accum,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=16,
         learning_rate=5e-6,
         bf16=True,
         logging_steps=1,
@@ -149,7 +138,7 @@ def train():
         save_steps=100,
         save_total_limit=2,
         max_steps=100,
-        deepspeed=ds_config,
+        deepspeed=DS_CONFIG_PATH,  # Передаем путь к JSON
         report_to="none",
         optim="adamw_torch",
         warmup_ratio=0.1,
