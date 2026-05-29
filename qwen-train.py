@@ -1,9 +1,9 @@
 import datetime
 import gc
+import json
 import os
 import pathlib
 
-import deepspeed
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
@@ -16,23 +16,23 @@ from transformers import (
     TrainingArguments,
 )
 
+# Импортируем мост между Transformers и DeepSpeed
+from transformers.integrations import HfDeepSpeedConfig
+
 # Оптимизация аллокатора памяти CUDA
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 BASE_DIR = str(pathlib.Path(__file__).parent.absolute())
 print(f"Working dir: {BASE_DIR}")
 
-# LoRA вешается строго на блоки внимания, чтобы не ломать и не трогать MoE экспертов
+# LoRA вешается строго на блоки внимания
 Qwen3_CODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
-
-# Модель по умолчанию, если не передана переменная окружения
 DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 def train():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    # Явно привязываем GPU к процессу и выставляем таймаут в 30 минут для стабильного стриминга весов
     if not dist.is_initialized():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
@@ -40,14 +40,14 @@ def train():
             device_id=torch.device(f"cuda:{local_rank}"),
             timeout=datetime.timedelta(seconds=1800),
         )
-    print(f"Local rank: {local_rank} initialized.")
 
-    # Динамически получаем имя модели из окружения
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    print(f"Local rank: {local_rank} initialized. World size: {world_size}")
+
     MODEL_ID = os.environ.get("MODEL_ID", DEFAULT_MODEL_ID)
     if local_rank == 0:
         print(f"\n=== TARGET MODEL FOR TRAINING: {MODEL_ID} ===\n")
 
-    # Токенизатор загружаем на всех процессах
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
         if "<|endoftext|>" in tokenizer.get_vocab():
@@ -58,7 +58,6 @@ def train():
     torch.cuda.empty_cache()
     gc.collect()
 
-    # Общая конфигурация LoRA для всех процессов
     peft_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -68,25 +67,37 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    # ФИКС КРИТИЧЕСКОЙ ОШИБКИ: Передаем конфигурацию напрямую в ZeRO-3 Init.
-    # Теперь DeepSpeed знает про CPU-оффлоад параметров до создания слоев и не падает на мета-тензорах.
+    # ДИНАМИЧЕСКАЯ СБОРКА КОНФИГА DEEPSPEED
     DS_CONFIG_PATH = os.path.join(BASE_DIR, "ds_config.json")
-    print(
-        f"Process {local_rank} is initializing model via DeepSpeed ZeRO-3 context with config..."
+    with open(DS_CONFIG_PATH, "r") as f:
+        ds_config = json.load(f)
+
+    micro_batch = 1
+    grad_accum = 16
+    ds_config["train_micro_batch_size_per_gpu"] = micro_batch
+    ds_config["gradient_accumulation_steps"] = grad_accum
+    ds_config["train_batch_size"] = micro_batch * grad_accum * world_size
+
+    if local_rank == 0:
+        print(
+            f"Generated DS Config: train_batch_size={ds_config['train_batch_size']} for world_size={world_size}"
+        )
+        print(f"Process {local_rank} is initializing HfDeepSpeedConfig...")
+
+    # ВАЖНО: Инициализируем HfDeepSpeedConfig ДО загрузки модели.
+    # Обязательно сохраняем ссылку в переменную ds_helper, чтобы объект жил в памяти.
+    # Это перехватит создание мета-тензоров внутри .from_pretrained() и предотвратит ошибку копирования.
+    ds_helper = HfDeepSpeedConfig(ds_config)
+
+    # Контекст "with deepspeed.zero.Init()" убираем — хелпер сделает всё сам автоматически и корректно
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     )
 
-    with deepspeed.zero.Init(config_dict_or_path=DS_CONFIG_PATH):
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        )
-
-    # Спокойно накатываем LoRA адаптеры на распределенную модель
     print(f"Process {local_rank} is applying LoRA layers...")
     model = get_peft_model(model, peft_config)
-
-    # Включаем чекпоинтинг градиентов для экономии памяти
     model.gradient_checkpointing_enable()
 
     print(f"Model and LoRA layers successfully prepared on rank {local_rank}")
@@ -125,12 +136,11 @@ def train():
         num_proc=1,
     )
 
-    # Динамически выставляем имя папки чекпоинтов на основе названия модели
     model_folder_name = MODEL_ID.split("/")[-1].lower()
     training_args = TrainingArguments(
         output_dir=f"{BASE_DIR}/{model_folder_name}-lora",
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=16,
+        per_device_train_batch_size=micro_batch,
+        gradient_accumulation_steps=grad_accum,
         learning_rate=5e-6,
         bf16=True,
         logging_steps=1,
@@ -139,7 +149,7 @@ def train():
         save_steps=100,
         save_total_limit=2,
         max_steps=100,
-        deepspeed=DS_CONFIG_PATH,
+        deepspeed=ds_config,
         report_to="none",
         optim="adamw_torch",
         warmup_ratio=0.1,
@@ -162,7 +172,6 @@ def train():
 
     trainer.train()
 
-    # Корректно закрываем распределенную группу при выходе
     if dist.is_initialized():
         dist.destroy_process_group()
 
